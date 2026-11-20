@@ -12,17 +12,28 @@ final class EventLog: ObservableObject {
         return f
     }()
 
+    private var lastMessage = ""
+    private var repeatCount = 1
+
     func add(_ message: String) {
-        let line = "\(formatter.string(from: Date())) \(message)"
+        let time = formatter.string(from: Date())
         if Thread.isMainThread {
-            append(line)
+            append(message, time: time)
         } else {
-            DispatchQueue.main.async { self.append(line) }
+            DispatchQueue.main.async { self.append(message, time: time) }
         }
     }
 
-    private func append(_ line: String) {
-        entries.append(line)
+    /// Collapses repeated messages into "message ×N".
+    private func append(_ message: String, time: String) {
+        if message == lastMessage, !entries.isEmpty {
+            repeatCount += 1
+            entries[entries.count - 1] = "\(time) \(message) ×\(repeatCount)"
+            return
+        }
+        lastMessage = message
+        repeatCount = 1
+        entries.append("\(time) \(message)")
         if entries.count > 500 { entries.removeFirst(entries.count - 500) }
     }
 }

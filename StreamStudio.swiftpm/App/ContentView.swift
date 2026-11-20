@@ -209,7 +209,7 @@ struct MicPicker: View {
                 Button {
                     audio.select(input.id)
                 } label: {
-                    let title = "\(input.name) · \(input.kind) · \(input.channels) кан."
+                    let title = input.channels > 0 ? "\(input.name) · \(input.kind) · \(input.channels) кан." : "\(input.name) · \(input.kind)"
                     if audio.currentID == input.id {
                         Label(title, systemImage: "checkmark")
                     } else {

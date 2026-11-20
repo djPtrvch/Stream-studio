@@ -54,6 +54,7 @@ struct DiagnosticsView: View {
 
                 Section("Звук") {
                     row("Текущий вход", audio.currentInput.map { "\($0.name) (\($0.kind))" } ?? "—")
+                    row("Выход", audio.outputName)
                     row("Частота", audio.sampleRate > 0 ? "\(Int(audio.sampleRate)) Гц" : "—")
                     row("Каналов", "\(audio.levels.count)")
                     ForEach(audio.inputs) { input in
@@ -93,7 +94,7 @@ struct DiagnosticsView: View {
 
     private func report() -> String {
         var lines: [String] = []
-        lines.append("== Stream Studio диагностика ==")
+        lines.append("== Stream Studio v0.2 диагностика ==")
         lines.append("iPadOS \(UIDevice.current.systemVersion)")
         lines.append("Мультикамера: \(cameras.isMultiCamSupported)")
         lines.append("Многозадачность камер: supported=\(cameras.multitaskingSupported) enabled=\(cameras.multitaskingEnabled)")
@@ -110,7 +111,7 @@ struct DiagnosticsView: View {
             lines.append("\(slot.rawValue): \(name) \(cameras.slotError[slot] ?? "")")
         }
         lines.append("-- Звук")
-        lines.append("Текущий: \(audio.currentInput?.name ?? "—"), \(Int(audio.sampleRate)) Гц, \(audio.levels.count) кан.")
+        lines.append("Текущий: \(audio.currentInput?.name ?? "—"), выход: \(audio.outputName), \(Int(audio.sampleRate)) Гц, \(audio.levels.count) кан.")
         for i in audio.inputs { lines.append("\(i.name) | \(i.kind) | \(i.channels) кан.") }
         lines.append("-- Журнал")
         lines.append(contentsOf: log.entries.suffix(150))

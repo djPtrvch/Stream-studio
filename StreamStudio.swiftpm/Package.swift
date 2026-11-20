@@ -17,8 +17,8 @@ let package = Package(
             name: "Stream Studio",
             targets: ["AppModule"],
             bundleIdentifier: "com.streamstudio.app",
-            displayVersion: "0.1",
-            bundleVersion: "1",
+            displayVersion: "0.2",
+            bundleVersion: "2",
             appIcon: .placeholder(icon: .camera),
             accentColor: .presetColor(.red),
             supportedDeviceFamilies: [

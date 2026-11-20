@@ -13,16 +13,20 @@ final class AudioManager: ObservableObject {
     @Published private(set) var inputs: [Input] = []
     @Published private(set) var currentID: String?
     @Published private(set) var preferredID: String?
+    @Published private(set) var outputName: String = "—"
     /// Peak level per channel, 0...1, with decay.
     @Published private(set) var levels: [Float] = []
     @Published private(set) var sampleRate: Double = 0
     @Published private(set) var permissionDenied = false
+    @Published private(set) var switching = false
 
     private let session = AVAudioSession.sharedInstance()
-    private let engine = AVAudioEngine()
-    private var tapInstalled = false
+    /// Recreated on every restart: a stale engine keeps the old hardware format (error -10868).
+    private var engine = AVAudioEngine()
+    private var engineRunning = false
     private var tokens: [NSObjectProtocol] = []
     private var started = false
+    private var restartWork: DispatchWorkItem?
     private let log = EventLog.shared
     private let defaultsKey = "audio.preferredInputUID"
 
@@ -49,11 +53,39 @@ final class AudioManager: ObservableObject {
         }
     }
 
+    /// Switch order matters: stop engine → deactivate → prefer → activate → new engine.
     func select(_ id: String) {
         preferredID = id
         UserDefaults.standard.set(id, forKey: defaultsKey)
-        applyPreferred()
-        restartEngine()
+        guard let port = session.availableInputs?.first(where: { $0.uid == id }) else {
+            log.add("Микрофон недоступен")
+            return
+        }
+        log.add("Выбор микрофона: \(port.portName)")
+        switching = true
+        stopEngine()
+        do {
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            log.add("Деактивация: \(Self.describe(error))")
+        }
+        do {
+            try session.setPreferredInput(port)
+            try session.setActive(true)
+        } catch {
+            log.add("Не удалось выбрать: \(Self.describe(error))")
+        }
+        maximizeChannels()
+        // Give iOS a moment to rebuild the route, then verify.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            self.refresh()
+            self.logRoute("после выбора")
+            if self.currentID != id {
+                self.log.add("⚠️ iOS не переключил вход (предпочтение: \(self.session.preferredInput?.portName ?? "нет"))")
+            }
+            self.switching = false
+            self.startEngine()
+        }
     }
 
     // MARK: - Setup
@@ -63,12 +95,18 @@ final class AudioManager: ObservableObject {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try session.setActive(true)
         } catch {
-            log.add("Аудиосессия: \(error.localizedDescription)")
+            log.add("Аудиосессия: \(Self.describe(error))")
         }
         observeNotifications()
         refresh()
-        applyPreferred()
-        restartEngine()
+        logRoute("старт")
+        if let preferredID, currentID != preferredID,
+           session.availableInputs?.contains(where: { $0.uid == preferredID }) == true {
+            select(preferredID)
+        } else {
+            maximizeChannels()
+            startEngine()
+        }
     }
 
     private func refresh() {
@@ -76,36 +114,48 @@ final class AudioManager: ObservableObject {
             Input(id: port.uid, name: port.portName, kind: Self.kind(of: port.portType), channels: port.channels?.count ?? 0)
         }
         currentID = session.currentRoute.inputs.first?.uid
+        outputName = session.currentRoute.outputs.map(\.portName).joined(separator: ", ")
     }
 
-    /// Re-asserts the user's choice. iOS switches to newly plugged devices on its own;
-    /// we switch back unless the user picks the new device explicitly.
-    private func applyPreferred() {
-        guard let preferredID,
-              let port = session.availableInputs?.first(where: { $0.uid == preferredID }) else { return }
+    private func maximizeChannels() {
+        let maxChannels = session.maximumInputNumberOfChannels
+        guard maxChannels > 1 else { return }
         do {
-            if session.currentRoute.inputs.first?.uid != preferredID {
-                try session.setPreferredInput(port)
-                log.add("Микрофон: \(port.portName)")
-            }
-            let maxChannels = session.maximumInputNumberOfChannels
-            if maxChannels > 1 {
-                try session.setPreferredInputNumberOfChannels(maxChannels)
-            }
+            try session.setPreferredInputNumberOfChannels(maxChannels)
         } catch {
-            log.add("Не удалось выбрать микрофон: \(error.localizedDescription)")
+            log.add("Каналы: \(Self.describe(error))")
         }
-        refresh()
+    }
+
+    private func logRoute(_ context: String) {
+        let input = session.currentRoute.inputs.map(\.portName).joined(separator: ", ")
+        let output = session.currentRoute.outputs.map(\.portName).joined(separator: ", ")
+        log.add("Маршрут (\(context)): вход=\(input.isEmpty ? "—" : input) выход=\(output.isEmpty ? "—" : output) каналов=\(session.inputNumberOfChannels)")
     }
 
     // MARK: - Engine / meters
 
-    private func restartEngine() {
-        engine.stop()
-        if tapInstalled {
+    private func stopEngine() {
+        restartWork?.cancel()
+        if engineRunning || engine.isRunning {
             engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
+            engine.stop()
         }
+        engineRunning = false
+    }
+
+    /// Debounced: route/config notifications often arrive in bursts.
+    private func scheduleRestart() {
+        guard !switching else { return }
+        restartWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.startEngine() }
+        restartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func startEngine() {
+        stopEngine()
+        engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let format = inputNode.inputFormat(forBus: 0)
         guard format.channelCount > 0, format.sampleRate > 0 else {
@@ -116,15 +166,16 @@ final class AudioManager: ObservableObject {
         sampleRate = format.sampleRate
         levels = Array(repeating: 0, count: Int(format.channelCount))
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.process(buffer)
         }
-        tapInstalled = true
         engine.prepare()
         do {
             try engine.start()
+            engineRunning = true
         } catch {
-            log.add("Аудиодвижок: \(error.localizedDescription)")
+            inputNode.removeTap(onBus: 0)
+            log.add("Аудиодвижок: \(Self.describe(error))")
         }
     }
 
@@ -157,35 +208,63 @@ final class AudioManager: ObservableObject {
             let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
             let reason = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
             self.refresh()
+            guard !self.switching else { return }
             switch reason {
             case .newDeviceAvailable:
-                self.log.add("Подключено аудиоустройство. Текущий выбор сохранён.")
-                self.applyPreferred()
-                self.restartEngine()
+                self.logRoute("подключено устройство")
+                // iOS jumps to the new device by itself. Return to the user's choice.
+                if let preferredID = self.preferredID, self.currentID != preferredID,
+                   self.session.availableInputs?.contains(where: { $0.uid == preferredID }) == true {
+                    self.log.add("Возвращаю выбранный микрофон")
+                    self.select(preferredID)
+                } else {
+                    self.scheduleRestart()
+                }
             case .oldDeviceUnavailable:
-                self.log.add("Аудиоустройство отключено. Сейчас: \(self.currentInput?.name ?? "—")")
-                self.restartEngine()
-            default:
+                self.logRoute("устройство отключено")
+                self.scheduleRestart()
+            case .some(let r):
+                self.logRoute("причина \(Self.describe(r))")
+            case .none:
                 break
             }
         })
 
-        tokens.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-            self?.restartEngine()
+        tokens.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
+            guard let self, note.object as AnyObject? === self.engine else { return }
+            self.log.add("Аудио: смена конфигурации устройства")
+            self.scheduleRestart()
         })
 
         tokens.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             guard let self else { return }
-            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            if raw == AVAudioSession.InterruptionType.ended.rawValue {
-                try? self.session.setActive(true)
-                self.restartEngine()
+            let info = note.userInfo ?? [:]
+            let type = (info[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+            if type == .ended {
                 self.log.add("Аудио возобновлено")
+                try? self.session.setActive(true)
+                self.scheduleRestart()
             } else {
-                self.log.add("⚠️ Аудио прервано")
+                var details: [String] = []
+                if let r = info[AVAudioSessionInterruptionReasonKey] as? UInt {
+                    details.append("причина \(r)")
+                }
+                if let suspended = info[AVAudioSessionInterruptionWasSuspendedKey] as? Bool, suspended {
+                    details.append("приложение было приостановлено")
+                }
+                if self.session.isOtherAudioPlaying { details.append("играет другое аудио") }
+                self.log.add("⚠️ Аудио прервано \(details.joined(separator: ", "))")
             }
         })
+
+        tokens.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.log.add("⚠️ Аудиосистема перезапущена")
+            self.configure()
+        })
     }
+
+    // MARK: - Helpers
 
     private static func kind(of type: AVAudioSession.Port) -> String {
         switch type {
@@ -196,5 +275,21 @@ final class AudioManager: ObservableObject {
         case .lineIn: return "Линейный"
         default: return type.rawValue
         }
+    }
+
+    private static func describe(_ reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .categoryChange: return "смена категории"
+        case .override: return "переопределение"
+        case .wakeFromSleep: return "выход из сна"
+        case .noSuitableRouteForCategory: return "нет подходящего маршрута"
+        case .routeConfigurationChange: return "смена конфигурации"
+        default: return "код \(reason.rawValue)"
+        }
+    }
+
+    private static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        return "\(ns.domain) \(ns.code)"
     }
 }

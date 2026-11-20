@@ -56,6 +56,7 @@ final class CameraManager: ObservableObject {
     private var devicesObserver: NSKeyValueObservation?
     private var tokens: [NSObjectProtocol] = []
     private var started = false
+    private var lastAppliedGeneration = 0
     private let log = EventLog.shared
 
     init() {
@@ -97,6 +98,7 @@ final class CameraManager: ObservableObject {
     }
 
     func assign(_ slot: Slot, to deviceID: String?) {
+        log.add("Выбор: слот \(slot.rawValue) = \(camera(id: deviceID)?.name ?? "нет")")
         wanted[slot] = deviceID
         UserDefaults.standard.set(deviceID, forKey: "camera.slot.\(slot.rawValue)")
         applyConfiguration()
@@ -150,11 +152,23 @@ final class CameraManager: ObservableObject {
 
     // MARK: - Session configuration
 
+    private var configGeneration = 0
+
     private func applyConfiguration() {
         let wantedSnapshot = wanted
         let multiCamSupported = isMultiCamSupported
+        configGeneration += 1
+        let generation = configGeneration
+        let startedAt = Date()
+
+        // Watchdog: report if the session queue hangs (e.g. a USB camera stuck negotiating).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.lastAppliedGeneration < generation else { return }
+            self.log.add("⚠️ Настройка камер не завершилась за 4 с (зависла сессия?)")
+        }
 
         queue.async { [self] in
+            log.add("Применяю конфигурацию #\(generation)")
             session.beginConfiguration()
 
             if session.isMultitaskingCameraAccessSupported {
@@ -232,7 +246,10 @@ final class CameraManager: ObservableObject {
             let mtSupported = session.isMultitaskingCameraAccessSupported
             let mtEnabled = session.isMultitaskingCameraAccessEnabled
 
+            let elapsed = Date().timeIntervalSince(startedAt)
             DispatchQueue.main.async {
+                self.lastAppliedGeneration = max(self.lastAppliedGeneration, generation)
+                if elapsed > 1 { self.log.add("Настройка камер заняла \(String(format: "%.1f", elapsed)) с") }
                 self.active = newActive
                 self.slotError = errors
                 self.hardwareCost = hw
